@@ -6,6 +6,8 @@ Autoposter screens of the admin panel (registered into handlers.admin's ACTIONS 
       ⏰ Timings        several times a day, posts per time (each time has its own count)
       📚 All Posts      every post of this channel (✅ posted / ⏳ pending), open one -> Post now / Delete
       ➕ Create Post    (a) range: first + last message of a source channel  (b) send / forward files, then Done
+      🧩 Post type      Classic (caption file = thumbnail, one link)  /  Image + Video (image 1, video 1, image 2 ... =
+                        one post with a free image link + an ad-gated video link, one fixed thumbnail 🖼)
       🗂 Queue          shuffled order of the posts (cycle, cursor, up next)
       🔀 Reshuffle      new random order, all posts pending again
       🔁 Mode           loop (reshuffle every cycle) / one pass (stop after every post is posted once)
@@ -17,6 +19,8 @@ import re
 import time
 
 from telegram import InlineKeyboardMarkup as M
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
 
 from database import db
 from database.db import settings as S
@@ -24,6 +28,7 @@ from handlers.admin import B, PAGE, action, ask, ask_chat, resolve_channel, show
 from handlers.upload import media_info
 from utils import autoposter as AP
 from utils import keyboards as K
+from utils.helpers import call
 from utils.links import share_link
 from utils.streamer import streamer
 
@@ -85,8 +90,11 @@ async def show_channel(update, cid: int, note: str = ""):
     total, posted = await db.ap_counts(cid)
     on = ch.get("enabled", True)
     loop = ch.get("loop", True)
+    iv = ch.get("ptype") == "iv"
     text = (f"{note}📺 <b>{html.escape(ch['title'])}</b>\n\n"
             f"Autoposter: {'ON ✅' if on else 'OFF ⏸'}\n"
+            f"🧩 New posts: <b>{'🖼🎬 Image + Video' if iv else '📄 Classic'}</b>"
+            + (f" · fixed thumbnail {'✅' if ch.get('iv_thumb') else '— (each post shows its own image)'}" if iv else "") + "\n"
             f"⏰ Timings (IST): {AP.fmt_slots(ch.get('slots', []))}\n"
             f"🔀 Order: shuffled · Cycle <b>{(ch.get('queue_state') or {}).get('cycle', 0)}</b> · "
             f"{'🔁 loop' if loop else '➡️ one pass'}\n"
@@ -94,6 +102,8 @@ async def show_channel(update, cid: int, note: str = ""):
     await show(update, text, M([
         [B("⏰ Timings", f"adm:aptm:{cid}"), B(f"📚 All Posts ({total})", f"adm:apall:{cid}:0")],
         [B("➕ Create Post", f"adm:apnew:{cid}"), B("🎨 Caption & Button", f"adm:apcb:{cid}")],
+        [B(f"🧩 Type: {'Image + Video' if iv else 'Classic'}", f"adm:aptype:{cid}")]
+        + ([B("🖼 Fixed Thumbnail", f"adm:apthumb:{cid}")] if iv else []),
         [B("🗂 Queue", f"adm:apq:{cid}"), B("🔀 Reshuffle", f"adm:apresh:{cid}")],
         [B(f"🔁 Mode: {'loop' if loop else 'one pass'}", f"adm:apmode:{cid}"),
          B("⏸ Turn OFF" if on else "▶️ Turn ON", f"adm:apon:{cid}")],
@@ -120,6 +130,67 @@ async def a_apon(update, context, args):
 @action("apreset")
 async def a_apreset(update, context, args):
     await a_apresh(update, context, args)          # old "mark all pending" button = a fresh reshuffle
+
+
+# ===================================================================== post type (Classic / Image + Video)
+@action("aptype")
+async def a_aptype(update, context, args):
+    """Switch what ➕ Create Post makes from now on. Posts already created keep their own type, the queue publishes both."""
+    cid = int(args[0])
+    ch = await db.ap_get_channel(cid)
+    if not ch:
+        await show(update, "⚠️ Channel not found.", K.back("ap"))
+        return
+    iv = ch.get("ptype") != "iv"
+    await db.ap_set(cid, ptype="iv" if iv else "classic")
+    await show_channel(
+        update, cid,
+        ("🖼🎬 <b>Image + Video</b> posts: send image 1, video 1, image 2, video 2 … in this order (➕ Create Post).\n"
+         "Each pair = ONE post with a free image link and an ad-gated video link. Set the 🖼 Fixed Thumbnail once.\n\n"
+         if iv else
+         "📄 <b>Classic</b> posts: a captioned file = thumbnail, the captionless files below it = the post's link.\n\n"))
+
+
+@action("apthumb")
+async def a_apthumb(update, context, args):
+    cid = int(args[0])
+    if not S.get("db_channel"):
+        await show(update, "⚠️ Set the Database Channel first.", M([[B("📡 Set Database Channel", "adm:dbch")]]))
+        return
+    context.user_data["ap_cid"] = cid
+    await ask(update, context, "ap_thumb",
+              "🖼 <b>Fixed thumbnail</b>\n\nSend ONE image (as a photo). Every Image + Video post of this channel is published "
+              "with this picture, the caption and the two buttons.\n"
+              "Send <code>-</code> to remove it (each post then shows its own image).")
+
+
+@state("ap_thumb")
+async def st_ap_thumb(update, context):
+    msg = update.effective_message
+    cid = context.user_data.get("ap_cid")
+    if cid is None:
+        return
+    if msg.text and msg.text.strip() == "-":
+        await db.ap_set(cid, iv_thumb="")
+        context.user_data.pop("state", None)
+        await msg.reply_text("✅ Fixed thumbnail removed.", reply_markup=K.back(f"apc:{cid}"))
+        return
+    channel = S.get("db_channel")
+    if not msg.photo or not channel:
+        await msg.reply_text("⚠️ Send the thumbnail as a <b>photo</b> (not as a file).", reply_markup=K.cancel())
+        return
+    token = db.new_token()
+    code = db.make_code(token, 0)
+    try:    # stored in the Database Channel under a backup code, like every other file (survives a channel restore)
+        copied = await call(context.bot.copy_message, channel["id"], msg.chat_id, msg.message_id,
+                            caption=f"<code>{code}</code>", parse_mode=ParseMode.HTML)
+    except TelegramError as e:
+        await msg.reply_text(f"⚠️ Could not save it: <code>{html.escape(str(e))}</code>", reply_markup=K.cancel())
+        return
+    await db.add_file(copied.message_id, "photo", "post thumbnail", update.effective_user.id, code=code, cap="")
+    await db.ap_set(cid, iv_thumb=token)
+    context.user_data.pop("state", None)
+    await msg.reply_text("✅ Fixed thumbnail saved.", reply_markup=K.back(f"apc:{cid}"))
 
 
 # ===================================================================== shuffled queue
@@ -205,12 +276,17 @@ async def show_cb(update, cid: int, note: str = ""):
         return
     tpl = (ch.get("cap_tpl") or "").replace("{caption}", "").strip()
     btn = ch.get("btn") or AP.DEFAULT_BTN
+    bi = ch.get("btn_img") or AP.DEFAULT_BTN_IMG
+    bv = ch.get("btn_vid") or AP.DEFAULT_BTN_VID
     await show(update,
                f"{note}🎨 <b>Caption &amp; Button</b> — {html.escape(ch['title'])}\n\n"
                f"📝 Fixed caption:\n{tpl or '— not set (each post uses its own caption) —'}\n\n"
-               f"🔘 Button: <b>{html.escape(btn)}</b>\n\n"
+               f"🔘 Button (classic posts): <b>{html.escape(btn)}</b>\n"
+               f"🖼 Image button (Image + Video): <b>{html.escape(bi)}</b>\n"
+               f"🎬 Video button (Image + Video): <b>{html.escape(bv)}</b>\n\n"
                "This one fixed caption is used on every post of this channel (also the ones already created).",
                M([[B("📝 Edit Caption", f"adm:apcap:{cid}"), B("🔘 Edit Button", f"adm:apbtn:{cid}")],
+                  [B("🖼 Image Button", f"adm:apbtnx:{cid}:i"), B("🎬 Video Button", f"adm:apbtnx:{cid}:v")],
                   [B("♻️ Reset to default", f"adm:apcbr:{cid}")],
                   [B("🔙 Back", f"adm:apc:{cid}")]]))
 
@@ -223,7 +299,7 @@ async def a_apcb(update, context, args):
 @action("apcbr")
 async def a_apcbr(update, context, args):
     cid = int(args[0])
-    await db.ap_set(cid, cap_tpl="", btn="")
+    await db.ap_set(cid, cap_tpl="", btn="", btn_img="", btn_vid="")
     await show_cb(update, cid, "♻️ Reset.\n\n")
 
 
@@ -270,6 +346,30 @@ async def st_ap_btn(update, context):
         await msg.reply_text(f"⚠️ Send text up to {AP.BTN_MAX} characters.", reply_markup=K.cancel())
         return
     await db.ap_set(cid, btn="" if txt == "-" else txt)
+    context.user_data.pop("state", None)
+    await msg.reply_text("✅ Button saved.", reply_markup=K.back(f"apcb:{cid}"))
+
+
+@action("apbtnx")
+async def a_apbtnx(update, context, args):
+    """Button label of the Image + Video type: i = image (free preview) button, v = video button."""
+    context.user_data["ap_cid"] = int(args[0])
+    context.user_data["ap_btn_which"] = "btn_img" if args[1] == "i" else "btn_vid"
+    default = AP.DEFAULT_BTN_IMG if args[1] == "i" else AP.DEFAULT_BTN_VID
+    await ask(update, context, "ap_btnx",
+              f"🔘 <b>{'Image' if args[1] == 'i' else 'Video'} button text</b>\n\nTwo buttons sit side by side, so keep it short "
+              f"(max {AP.BTN_MAX_IV} characters, emoji ok).\nSend <code>-</code> for the default ({default}).")
+
+
+@state("ap_btnx")
+async def st_ap_btnx(update, context):
+    msg = update.effective_message
+    cid, field = context.user_data.get("ap_cid"), context.user_data.get("ap_btn_which")
+    txt = (msg.text or "").strip()
+    if not txt or cid is None or field not in ("btn_img", "btn_vid") or len(txt) > AP.BTN_MAX_IV:
+        await msg.reply_text(f"⚠️ Send text up to {AP.BTN_MAX_IV} characters.", reply_markup=K.cancel())
+        return
+    await db.ap_set(cid, **{field: "" if txt == "-" else txt})
     context.user_data.pop("state", None)
     await msg.reply_text("✅ Button saved.", reply_markup=K.back(f"apcb:{cid}"))
 
@@ -362,8 +462,8 @@ async def a_apall(update, context, args):
     cid, page = int(args[0]), (int(args[1]) if len(args) > 1 else 0)
     total, posted = await db.ap_counts(cid)
     posts = await db.ap_list_posts(cid, page * PAGE, PAGE)
-    rows = [[B(f"{'✅' if p['posted'] else '⏳'} #{p['seq']} {p['title'][:24]} · {p['n_files']}", f"adm:app:{p['_id']}")]
-            for p in posts]
+    rows = [[B(f"{'✅' if p['posted'] else '⏳'} #{p['seq']}{' 🖼🎬' if p.get('ptype') == 'iv' else ''} {p['title'][:22]} · {p['n_files']}",
+               f"adm:app:{p['_id']}")] for p in posts]
     nav = []
     if page > 0:
         nav.append(B("⬅️ Prev", f"adm:apall:{cid}:{page - 1}"))
@@ -383,10 +483,15 @@ async def show_post(update, bot, token: str, note: str = ""):
     if not p:
         await show(update, "⚠️ Post not found.", K.back("ap"))
         return
+    if p.get("ptype") == "iv":
+        links = (f"🖼 Free image link:\n<code>{share_link(bot.username, p['img_token'])}</code>\n"
+                 f"🎬 Video link (ad gate):\n<code>{share_link(bot.username, token)}</code>")
+    else:
+        links = f"🔗 <code>{share_link(bot.username, token)}</code>"
     await show(update,
-               f"{note}📝 <b>#{p['seq']}</b> · {'✅ posted' if p['posted'] else '⏳ pending'}\n"
-               f"📁 Files: {p['n_files']}\n\n{html.escape(p['title'])}\n\n"
-               f"🔗 <code>{share_link(bot.username, token)}</code>",
+               f"{note}📝 <b>#{p['seq']}</b> · {'✅ posted' if p['posted'] else '⏳ pending'}"
+               f"{' · 🖼🎬 Image + Video' if p.get('ptype') == 'iv' else ''}\n"
+               f"📁 Files: {p['n_files']}\n\n{html.escape(p['title'])}\n\n{links}",
                M([[B("📤 Post now", f"adm:appnow:{token}")],
                   [B("🗑 Delete post", f"adm:apdel:{token}:0"), B("🗑 Delete post + link", f"adm:apdel:{token}:1")],
                   [B("🔙 Back", f"adm:apall:{p['chan']}:0")]]))
@@ -414,6 +519,8 @@ async def a_apdel(update, context, args):
     await db.ap_delete_post(args[0])
     if with_link:
         await db.delete_link(args[0])
+        if p and p.get("img_token"):                       # Image + Video: the free image link too
+            await db.delete_link(p["img_token"])
     await show(update,
                "🗑 Post and its share link deleted." if with_link
                else "🗑 Post deleted from the Autoposter (its share link still works).",
@@ -448,11 +555,18 @@ async def a_apnew(update, context, args):
     if not S.get("db_channel"):
         await show(update, "⚠️ Set the Database Channel first.", M([[B("📡 Set Database Channel", "adm:dbch")]]))
         return
-    await show(update,
-               "➕ <b>Create Post</b>\n\n"
-               "A file <b>with a caption</b> = the post's thumbnail. All files <b>without a caption</b> right below it "
+    ch = await db.ap_get_channel(cid) or {}
+    if ch.get("ptype") == "iv":
+        how = ("🖼🎬 <b>Image + Video</b> mode\n\nSend / forward in this order: <b>image 1, video 1, image 2, video 2 …</b>\n"
+               "Every (image + video) pair = ONE post with two links: the image link is a free preview (no ad), "
+               "the video link shows the ad first. Captions are kept (with their backup codes).\n"
+               "A photo without a video after it, or a video without a photo before it, is skipped.\n\nChoose how:")
+    else:
+        how = ("A file <b>with a caption</b> = the post's thumbnail. All files <b>without a caption</b> right below it "
                "are that post's files (one share link). The next captioned file starts the next post.\n"
-               "📷 A captionless <b>album</b> below a captioned file goes into that post's link.\n\nChoose how:",
+               "📷 A captionless <b>album</b> below a captioned file goes into that post's link.\n\nChoose how:")
+    await show(update,
+               "➕ <b>Create Post</b>\n\n" + how,
                M([[B("🔢 Range: first + last message", f"adm:aprange:{cid}")],
                   [B("📥 Send / forward files, then Done", f"adm:apcollect:{cid}")],
                   [B("🔙 Back", f"adm:apc:{cid}")]]))

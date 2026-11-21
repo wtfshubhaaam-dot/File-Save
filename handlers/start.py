@@ -173,8 +173,10 @@ async def _limit_reached(bot, chat_id: int):
 
 
 async def request_access(bot, chat_id: int, link: dict):
-    """Entry point for a user who passed force-subscribe: cooldown -> daily limit -> Monetag ad gate -> files."""
-    if not is_admin(chat_id):
+    """Entry point for a user who passed force-subscribe: cooldown -> daily limit -> Monetag ad gate -> files.
+    A FREE link (the image link of an Autoposter Image + Video post) skips cooldown, daily limit and ad gate."""
+    free = bool(link.get("free"))
+    if not is_admin(chat_id) and not free:
         wait = COOLDOWN_SECONDS - (time.monotonic() - _last_open.get(chat_id, 0.0))
         if wait > 0:
             await call(bot.send_message, chat_id,
@@ -188,7 +190,7 @@ async def request_access(bot, chat_id: int, link: dict):
             await _limit_reached(bot, chat_id)                  # don't make them watch an ad for nothing
             return
     await cluster.connect_animation(bot, chat_id)               # multi-server mode: "Connecting... Connected: <server>"
-    if await ads.gate(bot, chat_id, link):                      # Mini App button sent; files follow after the ad
+    if not free and await ads.gate(bot, chat_id, link):         # Mini App button sent; files follow after the ad
         return
     await deliver(bot, chat_id, link)
 
@@ -199,7 +201,7 @@ async def deliver(bot, chat_id: int, link: dict):
     if not ids:
         await _unavailable(bot, chat_id)
         return
-    if is_admin(chat_id):
+    if is_admin(chat_id) or link.get("free"):     # admins, and free-preview links: no daily count
         await _deliver(bot, chat_id, {**link, "ids": ids})
         return
 

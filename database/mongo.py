@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 CORE_ONLY = frozenset({
     "daily_usage", "ad_sessions", "pending_deletes", "daily_stats",
     "settings", "users", "links", "files", "known_chats", "transfer", "transfer_sent",
-    "ap_channels", "ap_posts", "cluster_nodes", "cluster_assign", "cluster_lease",
+    "ap_channels", "ap_posts", "cluster_nodes", "cluster_assign", "cluster_lease", "cluster_update_inbox",
 })
 
 # Default placement when MONGO_URI_2 / MONGO_URI_3 are set.

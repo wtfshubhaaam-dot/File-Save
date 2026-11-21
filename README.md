@@ -61,7 +61,7 @@ All servers share the same MongoDB.
 | `NODE_ID` | `n1` | `n2`, `n3`, ... (unique) |
 | `NODE_ROLE` | `gateway` (a 2nd server may also be `gateway` = standby) | `worker` |
 | `BASE_URL` | its own `https://...koyeb.app` | its own `https://...koyeb.app` |
-| `NODE_CAPACITY` (optional) | users per server, default 30 | same |
+| `NODE_CAPACITY` (optional) | users per server, default 10 | same |
 
 **Server names:** every server has a name users can see (`NODE_NAME`, e.g. `🔥 Phoenix`; empty = automatic: n1 ⚡ Falcon,
 n2 🔥 Phoenix, n3 🌩 Thunder, n4 🐉 Dragon...). When a user connects (or comes back after being inactive) he sees a short

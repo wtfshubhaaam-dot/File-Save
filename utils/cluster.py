@@ -507,13 +507,15 @@ async def process_local(data: dict):
     """
     uid = data.get("update_id")
     try:
-        if uid is not None and (uid in _seen_set or uid in _processing_ids):
-            return
+        if uid is not None and uid in _seen_set:
+            return True
+        if uid is not None and uid in _processing_ids:
+            return False
         if uid is not None:
             _processing_ids.add(uid)
         update = Update.de_json(data, _app.bot)
         if update is None:
-            return
+            return True
         user_id, kind = _update_user(data)
         if user_id is not None and kind in ("message", "callback_query"):
             _touch(user_id)
@@ -530,10 +532,12 @@ async def process_local(data: dict):
                     _seen_set.discard(_seen_ids[0])
                 _seen_ids.append(uid)
                 _seen_set.add(uid)
+            return True
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("Update %s failed", uid)
+            return False
         finally:
             live.tasks -= 1
     finally:
@@ -551,7 +555,7 @@ async def process_local(data: dict):
             _admitted_ids.discard(uid)
 
 
-def _admit_local(data: dict) -> bool:
+def _admit_local(data: dict, *, spawn: bool = True) -> bool:
     """Reserve a bounded processing slot BEFORE acknowledging HTTP.
 
     This is a process-local operation; the router separately enforces per-node
@@ -571,7 +575,8 @@ def _admit_local(data: dict) -> bool:
     if uid is not None:
         _admitted_ids.add(uid)
     try:
-        _spawn(process_local(data))
+        if spawn:
+            _spawn(process_local(data))
     except BaseException:
         live.reserved -= 1
         if user_id is not None:
@@ -744,8 +749,7 @@ async def dispatch(data: dict):
     """
     nid = router.target(data)
     if nid == config.NODE_ID:
-        if not _admit_local(data):
-            raise CapacityUnavailable("Gateway is busy")
+        await _enqueue_durable(data, config.NODE_ID)
         return
     res = await forward(nid, data)
     if res is True:
@@ -760,6 +764,138 @@ async def dispatch(data: dict):
         # worker, avoiding a duplicate on a different worker.
         log.warning("Unconfirmed handoff to %s; preserving sticky routing", nid)
     raise CapacityUnavailable("Worker did not acknowledge update")
+
+
+# ----------------------------------------------------------------------------- durable MongoDB inbox
+# The HTTP 200 means durable acceptance, not completed delivery. Telegram API side
+# effects cannot be exactly-once without idempotency in the individual handlers.
+INBOX_LEASE_SECONDS = 180
+INBOX_MAX_ATTEMPTS = 8
+ORPHAN_SCAN_EVERY = 10
+
+
+def orphaned_nodes(nodes: list, now: float) -> list[str]:
+    """Only recover work from known nodes with stale heartbeats."""
+    return [n["_id"] for n in nodes
+            if n.get("_id") != config.NODE_ID
+            and isinstance(n.get("hb"), (int, float))
+            and now - n["hb"] > STALE_AFTER]
+
+
+
+async def _enqueue_durable(data: dict, node: str) -> None:
+    update_id = data.get("update_id")
+    if type(update_id) is not int or update_id < 0:
+        raise ValueError("Invalid Telegram update_id")
+    # _id is global across all nodes: a failover cannot create two inbox entries.
+    now = dt.datetime.now(dt.timezone.utc)
+    await dbm.cl_inbox_col.update_one(
+        {"_id": update_id},
+        {"$setOnInsert": {"payload": data, "node": node, "state": "queued",
+                          "attempts": 0, "retry_at": now, "created": now,
+                          "expire_at": now + dt.timedelta(days=7)}}, upsert=True)
+
+
+async def _renew_inbox_lease(update_id: int):
+    """Extend the claim while a slow Telegram handler is still executing."""
+    while True:
+        await asyncio.sleep(30)
+        now = dt.datetime.now(dt.timezone.utc)
+        result = await dbm.cl_inbox_col.update_one(
+            {"_id": update_id, "owner": OWNER, "state": "processing"},
+            {"$set": {"lease_until": now + dt.timedelta(seconds=INBOX_LEASE_SECONDS)}})
+        if not result.matched_count:
+            raise RuntimeError("Lost durable update lease")
+
+
+async def _process_durable(data: dict) -> None:
+    update_id = data["update_id"]
+    success = False
+    renewer = asyncio.create_task(_renew_inbox_lease(update_id))
+    try:
+        success = bool(await process_local(data))
+        if renewer.done() and not renewer.cancelled() and renewer.exception() is not None:
+            log.error("Inbox lease renewal failed for update %s", update_id)
+            success = False
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Durable update %s failed", update_id)
+    finally:
+        renewer.cancel()
+        await asyncio.gather(renewer, return_exceptions=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        if success:
+            try:
+                await dbm.cl_inbox_col.update_one(
+                    {"_id": update_id, "owner": OWNER, "state": "processing"},
+                    {"$set": {"state": "done", "finished": now,
+                              "expire_at": now + dt.timedelta(days=7)},
+                     "$unset": {"payload": "", "owner": "", "lease_until": ""}})
+            except Exception:
+                log.exception("Could not mark update %s done; it may retry", update_id)
+        else:
+            try:
+                record = await dbm.cl_inbox_col.find_one({"_id": update_id}, {"attempts": 1})
+                attempts = int((record or {}).get("attempts", 0))
+                state = "failed" if attempts >= INBOX_MAX_ATTEMPTS else "queued"
+                await dbm.cl_inbox_col.update_one(
+                    {"_id": update_id, "owner": OWNER, "state": "processing"},
+                    {"$set": {"state": state, "retry_at": now + dt.timedelta(seconds=min(300, 2 ** min(attempts, 8)))},
+                     "$unset": {"owner": "", "lease_until": ""}})
+            except Exception:
+                log.exception("Could not schedule retry for %s; lease recovery will retry", update_id)
+
+
+async def inbox_loop():
+    """Poll persisted updates; only claim work with a free local capacity slot."""
+    dead_nodes = []
+    last_scan = 0.0
+    while not _draining:
+        try:
+            if live.reserved >= min(10, config.NODE_MAX_TASKS):
+                await asyncio.sleep(.3)
+                continue
+            now = dt.datetime.now(dt.timezone.utc)
+            if time.monotonic() - last_scan >= ORPHAN_SCAN_EVERY:
+                # Never steal work if health data cannot be read.
+                try:
+                    dead_nodes = orphaned_nodes(await _load_nodes(), time.time())
+                except Exception:
+                    dead_nodes = []
+                    log.exception("Cannot verify node health for inbox recovery")
+                last_scan = time.monotonic()
+            eligible = ({"node": {"$in": [config.NODE_ID] + dead_nodes}}
+                        if dead_nodes else {"node": config.NODE_ID})
+            doc = await dbm.cl_inbox_col.find_one_and_update(
+                {"$and": [eligible, {"$or": [
+                    {"state": "queued", "retry_at": {"$lte": now}},
+                    {"state": "processing", "lease_until": {"$lte": now}}]}]},
+                {"$set": {"state": "processing", "owner": OWNER,
+                          "lease_until": now + dt.timedelta(seconds=INBOX_LEASE_SECONDS)},
+                 "$inc": {"attempts": 1}},
+                sort=[("created", 1)], return_document=ReturnDocument.AFTER)
+            if doc is None:
+                await asyncio.sleep(.35)
+                continue
+            data = doc.get("payload")
+            if not isinstance(data, dict):
+                await dbm.cl_inbox_col.update_one({"_id": doc["_id"], "owner": OWNER},
+                                                 {"$set": {"state": "failed"}})
+                continue
+            if not _admit_local(data, spawn=False):
+                await dbm.cl_inbox_col.update_one(
+                    {"_id": doc["_id"], "owner": OWNER},
+                    {"$set": {"state": "queued", "retry_at": now + dt.timedelta(seconds=1)},
+                     "$unset": {"owner": "", "lease_until": ""}})
+                await asyncio.sleep(.3)
+                continue
+            _spawn(_process_durable(data))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Durable inbox poll failed")
+            await asyncio.sleep(2)
 
 
 # ----------------------------------------------------------------------------- HTTP routes
@@ -827,13 +963,13 @@ async def internal_update(request: web.Request):
         raise web.HTTPBadRequest()
     if not isinstance(data, dict):
         raise web.HTTPBadRequest()
-    uid = data.get("update_id")
-    if uid is not None and uid in _seen_set:
-        return web.Response(text="ok")
-    if uid is not None and (uid in _admitted_ids or uid in _processing_ids):
-        raise web.HTTPServiceUnavailable(headers={"Retry-After": "2"})
-    if not _admit_local(data):
-        raise web.HTTPServiceUnavailable(headers={"Retry-After": "5"})
+    try:
+        await _enqueue_durable(data, config.NODE_ID)
+    except ValueError:
+        raise web.HTTPBadRequest()
+    except Exception:
+        log.exception("Durable inbox unavailable; rejecting update for Telegram retry")
+        raise web.HTTPServiceUnavailable(headers={"Retry-After": "3"})
     return web.Response(text="ok")
 
 
@@ -1064,22 +1200,44 @@ async def stats_loop(bot):
         raise
 
 
-async def _set_webhook(bot):
+async def _set_webhook(bot, attempts: int = 6):
     if not config.BASE_URL.startswith("https://"):
-        log.error("Gateway needs BASE_URL = its public https URL, otherwise Telegram cannot reach it.")
-        return
+        raise RuntimeError("Gateway BASE_URL must be a public HTTPS URL")
     url = f"{config.BASE_URL}/tg/{WEBHOOK_SECRET}"
-    for attempt in range(6):
+    for attempt in range(attempts):
         try:
-            await bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET, allowed_updates=ALLOWED_UPDATES,
+            result = await bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET, allowed_updates=ALLOWED_UPDATES,
                                   max_connections=100, drop_pending_updates=False)
+            if result is False:
+                raise RuntimeError("Telegram rejected webhook registration")
             log.info("Telegram webhook set -> %s/tg/***", config.BASE_URL)
             return
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.warning("set_webhook failed (%s), retrying", type(e).__name__)
-            await asyncio.sleep(5 * (attempt + 1))
+            if attempt < attempts - 1:
+                await asyncio.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"Telegram webhook registration failed after {attempts} attempt(s)")
+
+
+async def _register_webhook_or_step_down(bot):
+    """Fail closed if Telegram rejects the webhook; release leadership for standby."""
+    try:
+        await _set_webhook(bot)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Gateway cannot register Telegram webhook; relinquishing lease")
+        global IS_GATEWAY
+        IS_GATEWAY = False
+        try:
+            await dbm.cl_lease_col.update_one(
+                {"_id": "gateway", "owner": OWNER}, {"$set": {"until": EPOCH}})
+        except Exception:
+            log.exception("Could not release gateway lease after webhook failure")
+        # Do not cancel this task from within itself. Lease loop will handle
+        # background cleanup on the next iteration; stop serving immediately.
 
 
 def set_hooks(promote, demote):
@@ -1128,7 +1286,7 @@ async def _promote(app):
     if _hooks.get("promote"):
         _hooks["promote"]()
     _gw_tasks.extend([asyncio.create_task(router_loop()), asyncio.create_task(stats_loop(app.bot)),
-                      asyncio.create_task(_set_webhook(app.bot))])      # webhook LAST: traffic arrives when we are ready
+                      asyncio.create_task(_register_webhook_or_step_down(app.bot))])
     try:
         await beat()                                        # role shows up in Panel -> Servers at once
     except Exception:
@@ -1177,8 +1335,10 @@ async def lease_loop(app):
 
 async def start(app) -> list:
     """Called from main.post_init when ENABLED. Returns the background tasks."""
+    if int(os.getenv("WEB_CONCURRENCY", "1")) != 1 or int(os.getenv("UVICORN_WORKERS", "1")) != 1:
+        raise RuntimeError("Cluster strict capacity requires exactly one application process per NODE_ID")
     await beat()                                            # appear in the server list at once
-    tasks = [asyncio.create_task(heartbeat_loop())]
+    tasks = [asyncio.create_task(heartbeat_loop()), asyncio.create_task(inbox_loop())]
     if CAN_GATEWAY:
         tasks.append(asyncio.create_task(lease_loop(app)))  # wins the lease -> _promote() (router, stats, webhook, jobs)
     _bg.extend(tasks)

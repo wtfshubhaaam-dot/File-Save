@@ -6,6 +6,11 @@ Autoposter engine (no UI here - the panel lives in handlers/autoposter.py).
   item_from_ptb / item_from_pyro   one source message -> a small dict
   group_posts               caption file = thumbnail, captionless files below it = the post's files
   create_posts              copy everything into the Database Channel (with backup codes), make links + post records
+                            (channel post type "iv" -> create_iv_posts: image + video pairs, see below)
+  group_iv / create_iv_posts / _send_iv
+                            POST TYPE "Image + Video": image 1, video 1, image 2, video 2 ... Every (image + video) pair is ONE
+                            post with TWO links: the image link is a free preview (no ad gate, no daily-limit count), the video
+                            link goes through the ad gate. The post in the channel shows ONE fixed thumbnail (set per channel).
   send_post                 publish one post (thumbnail + caption + "Get Files" button) to a channel / group
   ensure_queue              shuffled queue: every post once per cycle in random order (loop = reshuffle each cycle,
                             one pass = pause when every post is posted); new posts are mixed into the running cycle
@@ -142,6 +147,12 @@ def group_posts(items: list):
 # ------------------------------------------------------------------ post caption / button (set from the admin panel)
 DEFAULT_BTN = "📥 Get Files"
 BTN_MAX = 40
+# Image + Video type: two buttons side by side, so the labels stay short
+DEFAULT_BTN_IMG = "🖼 Free Preview"
+DEFAULT_BTN_VID = "🎬 Watch Video"
+BTN_MAX_IV = 24
+IV_IMAGE = ("photo",)                          # the image of a pair
+IV_VIDEO = ("video", "document", "animation")  # the video of a pair (videos are often sent as files)
 
 
 def _plain_len(h: str) -> int:
@@ -182,6 +193,8 @@ async def _store(bot, channel_id: int, it: dict, code: str, by: int) -> int:
 
 async def create_posts(bot, items: list, cid: int, by: int, status_chat: int, status_msg: int):
     """Group `items` into posts, store them in the Database Channel and register them for channel `cid`."""
+    if ((await db.ap_get_channel(cid)) or {}).get("ptype") == "iv":      # this channel makes Image + Video posts
+        return await create_iv_posts(bot, items, cid, by, status_chat, status_msg)
     channel = S.get("db_channel")
     kb = M([[B("📺 Open channel", callback_data=f"adm:apc:{cid}")]])
     if not channel:
@@ -245,10 +258,124 @@ async def create_posts(bot, items: list, cid: int, by: int, status_chat: int, st
     await progress(final=True)
 
 
+# ------------------------------------------------------------------ Image + Video posts
+def group_iv(items: list):
+    """image 1, video 1, image 2, video 2 ...  ->  [{"img": item, "vid": item}, ...], skipped.
+    Every photo starts a pair, the next video / video-file completes it. A photo that never gets a video, a video without a
+    photo before it, a second video in a row and every other file type are skipped (counted)."""
+    pairs, skipped, img = [], 0, None
+    for it in items:
+        kind = it["kind"]
+        if kind in IV_IMAGE:
+            if img is not None:
+                skipped += 1                      # the previous image never got its video
+            img = it
+        elif kind in IV_VIDEO:
+            if img is None:
+                skipped += 1                      # video without an image above it
+            else:
+                pairs.append({"img": img, "vid": it})
+                img = None
+        else:
+            skipped += 1
+    if img is not None:
+        skipped += 1
+    return pairs, skipped
+
+
+async def create_iv_posts(bot, items: list, cid: int, by: int, status_chat: int, status_msg: int):
+    """Store every (image, video) pair in the Database Channel (BOTH under a backup code, with their captions), make two links
+    (image = free preview, video = normal ad-gated link) and ONE post record per pair."""
+    channel = S.get("db_channel")
+    kb = M([[B("📺 Open channel", callback_data=f"adm:apc:{cid}")]])
+    if not channel:
+        await bot.edit_message_text("⚠️ Database Channel is not set.", chat_id=status_chat,
+                                    message_id=status_msg, reply_markup=kb)
+        return
+
+    pairs, skipped = group_iv(sorted(items, key=lambda i: i["mid"]))
+    seq = await db.ap_last_seq(cid)
+    made = stored = 0
+    new_tokens = []
+    error = ""
+    last_edit = 0.0
+
+    async def progress(final=False):
+        nonlocal last_edit
+        if not final and time.time() - last_edit < 3:
+            return
+        last_edit = time.time()
+        head = "⏳ <b>Creating posts…</b>" if not final else ("✅ <b>Posts created</b>" if not error else "⚠️ <b>Stopped</b>")
+        text = f"{head}\n\n🖼🎬 Image + Video posts: {made}\n📁 Files stored: {stored}/{len(pairs) * 2}\n"
+        if skipped:
+            text += f"⏭ Skipped (no matching image + video pair): {skipped}\n"
+        if error:
+            text += f"\n❌ <code>{html.escape(error)}</code>"
+        try:
+            await bot.edit_message_text(text, chat_id=status_chat, message_id=status_msg,
+                                        reply_markup=kb if final else None)
+        except TelegramError:
+            pass
+
+    for p in pairs:
+        img_token, vid_token = db.new_token(), db.new_token()
+        try:
+            img_mid = await _store(bot, channel["id"], p["img"], db.make_code(img_token, 0), by)
+            stored += 1
+            vid_mid = await _store(bot, channel["id"], p["vid"], db.make_code(vid_token, 0), by)
+            stored += 1
+        except TelegramError as e:
+            error = str(e)
+            break
+        cap_html = (p["img"]["cap_html"] or p["vid"]["cap_html"] or "").strip()
+        plain = (p["img"]["cap"] or p["vid"]["cap"] or "")
+        title = re.sub(r"\s+", " ", plain).strip()[:40] or "Image + Video"
+        await db.create_link([img_mid], by, title, token=img_token, free=True)     # free preview: no ads, no daily count
+        await db.create_link([vid_mid], by, title, token=vid_token)                # the normal link: force-sub, limit, ads
+        seq += 1
+        # post id = the VIDEO token (like a classic post's link token); the image link hangs on it as img_token
+        await db.ap_add_post(cid, vid_token, "", seq, title, cap_html, "photo", 2, by, ptype="iv", img_token=img_token)
+        made += 1
+        new_tokens.append(vid_token)
+        await progress()
+    await db.ap_enqueue_new(cid, new_tokens)
+    await progress(final=True)
+
+
+async def _send_iv(bot, chat_id: int, post: dict, mark: bool):
+    """Publish one Image + Video post: ONE fixed thumbnail + caption + two link buttons (image | video)."""
+    channel = S.get("db_channel")
+    if not channel:
+        return "Database Channel is not set"
+    ch = await db.ap_get_channel(chat_id) or {}
+    thumb = None
+    if ch.get("iv_thumb"):                                        # the channel's fixed thumbnail (looked up by backup code)
+        thumb = await db.thumb_msg_id(db.make_code(ch["iv_thumb"], 0))
+    if not thumb and post.get("img_token"):                       # none set (or it is gone): the post's own image
+        thumb = await db.thumb_msg_id(db.make_code(post["img_token"], 0))
+    if not thumb:
+        return "thumbnail not found in the Database Channel"
+    btn_i = (ch.get("btn_img") or "").strip() or DEFAULT_BTN_IMG
+    btn_v = (ch.get("btn_vid") or "").strip() or DEFAULT_BTN_VID
+    kb = M([[B(btn_i, url=share_link(bot.username, post["img_token"])),
+             B(btn_v, url=share_link(bot.username, post["_id"]))]])
+    try:
+        await call(bot.copy_message, chat_id, channel["id"], thumb,
+                   caption=render_caption(ch.get("cap_tpl"), post["cap"]),
+                   parse_mode=ParseMode.HTML, reply_markup=kb)
+    except TelegramError as e:
+        return str(e)
+    if mark:
+        await db.ap_mark_posted(post["_id"])
+    return None
+
+
 # ------------------------------------------------------------------ publishing
 async def send_post(bot, chat_id: int, post: dict, mark: bool = True):
     """Publish one post to the channel / group. Returns None on success, else an error text.
     mark=False: the caller (the queue) records the post as posted itself."""
+    if post.get("ptype") == "iv":                  # Image + Video post (a channel can hold both kinds)
+        return await _send_iv(bot, chat_id, post, mark)
     channel = S.get("db_channel")
     if not channel:
         return "Database Channel is not set"

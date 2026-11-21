@@ -46,6 +46,7 @@ vps_col = col("vps_usage")            # _id="YYYY-MM-DD-HH|<node>" (IST): hourly
 cl_nodes_col = col("cluster_nodes")   # _id=node id: url, heartbeat, capacity, cpu, ram, tasks, streams (utils/cluster.py) [core only]
 cl_assign_col = col("cluster_assign") # _id=user id: node the user is pinned to + last seen (short-lived)               [core only]
 cl_stats_col = col("cluster_stats")   # _id="YYYY-MM-DD-HH" (IST): peak active users, per-node peaks, overflow events    [logs]
+cl_inbox_col = col("cluster_update_inbox")  # durable update inbox [core only]
 cl_lease_col = col("cluster_lease")   # _id="gateway": owner, until (Mongo server time), term (utils/cluster.py)         [core only]
 stats_col = col("daily_stats")        # _id="YYYY-MM-DD" (IST): views, gates, imp, clk, valued, rev, verified, fallback, blocked [hot]
 
@@ -134,6 +135,8 @@ _INDEXES = [
     (usage_col, "expire_at", {"expireAfterSeconds": 0}),            # old counters clean themselves
     (ads_col, "expire_at", {"expireAfterSeconds": 0}),
     (vps_col, "expire_at", {"expireAfterSeconds": 0}),              # VPS usage history is kept ~13 months
+    (cl_inbox_col, "expire_at", {"expireAfterSeconds": 0}),
+    (cl_inbox_col, [("node", 1), ("state", 1), ("retry_at", 1)], {}),
     (cl_assign_col, "expire_at", {"expireAfterSeconds": 0}),
     (cl_stats_col, "expire_at", {"expireAfterSeconds": 0}),
     (ads_col, [("uid", 1), ("status", 1)], {}),
@@ -334,12 +337,14 @@ async def restore_file(token: str, idx: int, new_msg_id: int, kind: str, name: s
     _cap_cache.clear()
 
 
-async def create_link(ids: list, creator: int, label: str, token: str = None) -> str:
+async def create_link(ids: list, creator: int, label: str, token: str = None, free: bool = False) -> str:
+    """free=True: a free-preview link (Autoposter Image + Video type): no ad gate, does not use the daily limit."""
     token = token or new_token()
-    await links_col.insert_one(
-        {"_id": token, "ids": ids, "creator": creator, "label": label,
-         "created": time.time(), "views": 0}
-    )
+    doc = {"_id": token, "ids": ids, "creator": creator, "label": label,
+           "created": time.time(), "views": 0}
+    if free:
+        doc["free"] = True
+    await links_col.insert_one(doc)
     return token
 
 
@@ -566,12 +571,13 @@ async def ap_last_seq(cid: int) -> int:
 
 
 async def ap_add_post(cid: int, token: str, thumb_token: str, seq: int, title: str, cap: str,
-                      kind: str, n_files: int, by: int):
-    """token = the share-link token of the files; thumb_token = backup code token of the thumbnail copy in the DB channel."""
+                      kind: str, n_files: int, by: int, **extra):
+    """token = the share-link token of the files; thumb_token = backup code token of the thumbnail copy in the DB channel.
+    extra: Image + Video posts add ptype="iv" and img_token (the free image link); classic posts add nothing."""
     await ap_posts_col.insert_one({
         "_id": token, "chan": cid, "seq": seq, "thumb_token": thumb_token, "title": title,
         "cap": cap, "kind": kind, "n_files": n_files, "by": by,
-        "posted": False, "posted_at": None, "created": time.time(),
+        "posted": False, "posted_at": None, "created": time.time(), **extra,
     })
 
 
@@ -608,11 +614,13 @@ async def ap_delete_post(token: str):
 async def ap_wipe(cid: int, only_posted: bool = False, links: bool = False) -> int:
     """Delete every post of a channel (optionally only the posted ones, optionally their share links too)."""
     q = {"chan": cid, **({"posted": True} if only_posted else {})}
-    tokens = [d["_id"] for d in await ap_posts_col.find(q, {"_id": 1}).to_list(None)]
+    docs = await ap_posts_col.find(q, {"_id": 1, "img_token": 1}).to_list(None)
+    tokens = [d["_id"] for d in docs]
     if tokens:
         await ap_posts_col.delete_many({"_id": {"$in": tokens}})
         if links:
-            await links_col.delete_many({"_id": {"$in": tokens}})
+            extra = [d["img_token"] for d in docs if d.get("img_token")]      # Image + Video: the free image links too
+            await links_col.delete_many({"_id": {"$in": tokens + extra}})
         await ap_channels_col.update_one({"_id": cid}, {"$set": {"queue_state": _blank_queue()}})
     return len(tokens)
 
